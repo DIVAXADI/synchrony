@@ -31,7 +31,7 @@ interface RoomState {
 
 export default function Room() {
   const params = useParams<{ code: string }>()
-  const roomCode = params.code
+  const roomCode = params?.code || ''
 
   const [socket, setSocket] = useState<Socket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
