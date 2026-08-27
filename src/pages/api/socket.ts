@@ -39,6 +39,44 @@ export const config = {
   },
 }
 
+// Fetch library from GitHub Releases
+async function getLibrary(): Promise<Track[]> {
+  const GITHUB_REPO = 'DIVAXADI/synchrony'
+
+  try {
+    const response = await fetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v1.0.0-music`,
+      {
+        headers: {
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        next: { revalidate: 60 } // Cache for 60 seconds
+      }
+    )
+
+    if (!response.ok) {
+      return []
+    }
+
+    const release = await response.json()
+
+    const audioExtensions = ['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac']
+    return release.assets
+      .filter((asset: any) => audioExtensions.some(ext => asset.name.toLowerCase().endsWith(ext)))
+      .map((asset: any) => ({
+        id: asset.id.toString(),
+        title: asset.name.replace(/\.[^/.]+$/, ''),
+        artist: 'Unknown Artist',
+        duration: 0,
+        url: asset.browser_download_url,
+        addedBy: 'System',
+      }))
+  } catch (error) {
+    console.error('Error fetching library:', error)
+    return []
+  }
+}
+
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (!io) {
     // @ts-ignore - Next.js specific
@@ -55,7 +93,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       console.log('Client connected:', socket.id)
 
       // Join room
-      socket.on('join', ({ roomCode, userName }: { roomCode: string; userName: string }) => {
+      socket.on('join', async ({ roomCode, userName }: { roomCode: string; userName: string }) => {
         socket.join(roomCode)
 
         // Initialize room if it doesn't exist
@@ -83,8 +121,9 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
           listeners: room.listeners.size,
         })
 
-        // Send library (placeholder - will be from R2)
-        socket.emit('library', getLibrary())
+        // Send library from GitHub Releases
+        const library = await getLibrary()
+        socket.emit('library', library)
 
         // Notify others
         socket.to(roomCode).emit('message', {
@@ -257,58 +296,4 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   res.end()
-}
-
-// Placeholder library - will be loaded from R2
-function getLibrary(): Track[] {
-  return [
-    {
-      id: '1',
-      title: 'Sunset Vibes',
-      artist: 'MixMaster',
-      duration: 260,
-      url: '/music/sunset-vibes.mp3',
-      addedBy: 'System',
-    },
-    {
-      id: '2',
-      title: 'Chill Beats',
-      artist: 'LofiGang',
-      duration: 225,
-      url: '/music/chill-beats.mp3',
-      addedBy: 'System',
-    },
-    {
-      id: '3',
-      title: 'Night Drive',
-      artist: 'SynthWave',
-      duration: 312,
-      url: '/music/night-drive.mp3',
-      addedBy: 'System',
-    },
-    {
-      id: '4',
-      title: 'Morning Coffee',
-      artist: 'LofiGang',
-      duration: 198,
-      url: '/music/morning-coffee.mp3',
-      addedBy: 'System',
-    },
-    {
-      id: '5',
-      title: 'Electric Dreams',
-      artist: 'SynthWave',
-      duration: 285,
-      url: '/music/electric-dreams.mp3',
-      addedBy: 'System',
-    },
-    {
-      id: '6',
-      title: 'Summer Breeze',
-      artist: 'ChillHop',
-      duration: 243,
-      url: '/music/summer-breeze.mp3',
-      addedBy: 'System',
-    },
-  ]
 }
