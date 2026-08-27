@@ -1,8 +1,7 @@
 'use client'
 
 import { useParams } from 'next/navigation'
-import { useEffect, useState, useRef, useCallback } from 'react'
-import { io, Socket } from 'socket.io-client'
+import { useEffect, useState, useRef } from 'react'
 
 // Types
 interface Track {
@@ -29,147 +28,208 @@ interface RoomState {
   listeners: number
 }
 
+// Simple BroadcastChannel for cross-tab sync (works on same browser)
+// For cross-device sync, users can share the room state manually
+const useSync = (roomCode: string) => {
+  const channelRef = useRef<BroadcastChannel | null>(null)
+
+  useEffect(() => {
+    channelRef.current = new BroadcastChannel(`synchrony-${roomCode}`)
+    return () => {
+      channelRef.current?.close()
+    }
+  }, [roomCode])
+
+  return channelRef
+}
+
 export default function Room() {
   const params = useParams<{ code: string }>()
   const roomCode = params?.code || ''
 
-  const [socket, setSocket] = useState<Socket | null>(null)
-  const [isConnected, setIsConnected] = useState(false)
+  const channelRef = useSync(roomCode)
+
   const [userName, setUserName] = useState('')
   const [hasJoined, setHasJoined] = useState(false)
-  const [roomState, setRoomState] = useState<RoomState>({
-    isPlaying: false,
-    currentTime: 0,
-    currentTrack: null,
-    queue: [],
-    listeners: 0
-  })
+  const [isHost, setIsHost] = useState(false)
+  const [library, setLibrary] = useState<Track[]>([])
+  const [isLoadingLibrary, setIsLoadingLibrary] = useState(true)
+
+  const [isPlaying, setIsPlaying] = useState(false)
+  const [currentTime, setCurrentTime] = useState(0)
+  const [currentTrack, setCurrentTrack] = useState<Track | null>(null)
+  const [queue, setQueue] = useState<Track[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [messageInput, setMessageInput] = useState('')
-  const [library, setLibrary] = useState<Track[]>([])
   const [volume, setVolume] = useState(0.8)
-  const [isHost, setIsHost] = useState(false)
 
   const audioRef = useRef<HTMLAudioElement>(null)
   const progressRef = useRef<HTMLDivElement>(null)
 
-  // Initialize socket connection
+  // Fetch library from GitHub Releases
   useEffect(() => {
-    const newSocket = io(process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin, {
-      path: '/api/socket',
-      transports: ['websocket', 'polling']
-    })
-
-    newSocket.on('connect', () => {
-      setIsConnected(true)
-    })
-
-    newSocket.on('disconnect', () => {
-      setIsConnected(false)
-    })
-
-    newSocket.on('room-state', (state: RoomState) => {
-      setRoomState(state)
-    })
-
-    newSocket.on('sync', (data: { currentTime: number; isPlaying: boolean }) => {
-      if (audioRef.current) {
-        const drift = Math.abs(audioRef.current.currentTime - data.currentTime)
-        if (drift > 0.3) {
-          audioRef.current.currentTime = data.currentTime
-        }
-        if (data.isPlaying && audioRef.current.paused) {
-          audioRef.current.play()
-        } else if (!data.isPlaying && !audioRef.current.paused) {
-          audioRef.current.pause()
-        }
+    const fetchLibrary = async () => {
+      try {
+        const response = await fetch('/api/library')
+        const data = await response.json()
+        setLibrary(data.library || [])
+      } catch (error) {
+        console.error('Failed to fetch library:', error)
+      } finally {
+        setIsLoadingLibrary(false)
       }
-    })
-
-    newSocket.on('message', (message: Message) => {
-      setMessages(prev => [...prev, message])
-    })
-
-    newSocket.on('library', (tracks: Track[]) => {
-      setLibrary(tracks)
-    })
-
-    setSocket(newSocket)
-
-    return () => {
-      newSocket.close()
     }
+    fetchLibrary()
   }, [])
 
-  // Sync playback position
+  // Listen for sync messages
   useEffect(() => {
-    if (!socket || !audioRef.current) return
+    if (!channelRef.current) return
 
-    const interval = setInterval(() => {
-      if (audioRef.current && roomState.isPlaying) {
-        socket.emit('sync', {
-          currentTime: audioRef.current.currentTime,
-          isPlaying: roomState.isPlaying
-        })
+    channelRef.current.onmessage = (event) => {
+      const { type, data } = event.data
+
+      switch (type) {
+        case 'playback':
+          setIsPlaying(data.isPlaying)
+          if (audioRef.current) {
+            if (data.isPlaying) {
+              audioRef.current.play()
+            } else {
+              audioRef.current.pause()
+            }
+          }
+          break
+        case 'seek':
+          setCurrentTime(data.time)
+          if (audioRef.current) {
+            audioRef.current.currentTime = data.time
+          }
+          break
+        case 'track':
+          setCurrentTrack(data.track)
+          setCurrentTime(0)
+          if (data.track && audioRef.current) {
+            audioRef.current.src = data.track.url
+            if (data.isPlaying) {
+              audioRef.current.play()
+            }
+          }
+          break
+        case 'queue':
+          setQueue(data.queue)
+          break
+        case 'message':
+          setMessages(prev => [...prev, data.message])
+          break
       }
-    }, 2000)
+    }
+  }, [channelRef])
 
-    return () => clearInterval(interval)
-  }, [socket, roomState.isPlaying])
+  // Broadcast changes
+  const broadcast = (type: string, data: any) => {
+    channelRef.current?.postMessage({ type, data })
+  }
 
   // Join room
   const joinRoom = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!userName.trim() || !socket) return
-
-    socket.emit('join', { roomCode, userName: userName.trim() })
+    if (!userName.trim()) return
     setHasJoined(true)
-
-    // First person to join is host
-    if (roomState.listeners === 0) {
-      setIsHost(true)
-    }
+    setIsHost(true)
   }
 
   // Playback controls
   const togglePlay = () => {
-    if (!socket) return
-    socket.emit('playback', { isPlaying: !roomState.isPlaying })
+    const newState = !isPlaying
+    setIsPlaying(newState)
+    if (audioRef.current) {
+      if (newState) {
+        audioRef.current.play()
+      } else {
+        audioRef.current.pause()
+      }
+    }
+    broadcast('playback', { isPlaying: newState })
   }
 
   const seek = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!progressRef.current || !audioRef.current || !roomState.currentTrack) return
+    if (!progressRef.current || !audioRef.current || !currentTrack) return
 
     const rect = progressRef.current.getBoundingClientRect()
     const percent = (e.clientX - rect.left) / rect.width
-    const newTime = percent * roomState.currentTrack.duration
+    const newTime = percent * currentTrack.duration
 
-    if (socket) {
-      socket.emit('seek', { time: newTime })
-    }
+    setCurrentTime(newTime)
+    audioRef.current.currentTime = newTime
+    broadcast('seek', { time: newTime })
   }
 
   const nextTrack = () => {
-    if (!socket) return
-    socket.emit('next')
+    if (queue.length === 0) {
+      setCurrentTrack(null)
+      setIsPlaying(false)
+      setCurrentTime(0)
+      broadcast('track', { track: null, isPlaying: false })
+      return
+    }
+
+    const next = queue[0]
+    const newQueue = queue.slice(1)
+    setCurrentTrack(next)
+    setQueue(newQueue)
+    setCurrentTime(0)
+
+    broadcast('track', { track: next, isPlaying: true })
+    broadcast('queue', { queue: newQueue })
+
+    if (audioRef.current) {
+      audioRef.current.src = next.url
+      audioRef.current.play()
+      setIsPlaying(true)
+    }
   }
 
   const addToQueue = (track: Track) => {
-    if (!socket) return
-    socket.emit('add-to-queue', { track, userName })
+    const newTrack = { ...track, addedBy: userName }
+
+    if (!currentTrack) {
+      setCurrentTrack(newTrack)
+      setCurrentTime(0)
+      setIsPlaying(true)
+      broadcast('track', { track: newTrack, isPlaying: true })
+
+      if (audioRef.current) {
+        audioRef.current.src = newTrack.url
+        audioRef.current.play()
+      }
+    } else {
+      const newQueue = [...queue, newTrack]
+      setQueue(newQueue)
+      broadcast('queue', { queue: newQueue })
+    }
   }
 
   const removeFromQueue = (trackId: string) => {
-    if (!socket) return
-    socket.emit('remove-from-queue', { trackId })
+    const newQueue = queue.filter(t => t.id !== trackId)
+    setQueue(newQueue)
+    broadcast('queue', { queue: newQueue })
   }
 
   const sendMessage = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!messageInput.trim() || !socket) return
+    if (!messageInput.trim()) return
 
-    socket.emit('message', { text: messageInput.trim(), userName })
+    const message: Message = {
+      id: Date.now().toString(),
+      user: userName,
+      text: messageInput.trim(),
+      timestamp: Date.now(),
+    }
+
+    setMessages(prev => [...prev, message])
     setMessageInput('')
+    broadcast('message', { message })
   }
 
   const formatTime = (seconds: number) => {
@@ -215,13 +275,15 @@ export default function Room() {
   return (
     <main className="min-h-screen flex flex-col">
       {/* Hidden audio element */}
-      {roomState.currentTrack && (
+      {currentTrack && (
         <audio
           ref={audioRef}
-          src={roomState.currentTrack.url}
-          onTimeUpdate={(e) => setRoomState(prev => ({ ...prev, currentTime: e.currentTarget.currentTime }))}
+          src={currentTrack.url}
+          onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
           onEnded={nextTrack}
-          volume={volume}
+          onLoadedMetadata={(e) => {
+            // Update duration if different
+          }}
         />
       )}
 
@@ -239,14 +301,8 @@ export default function Room() {
 
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-sm">
-              <span className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
-              <span className="text-gray-400">{isConnected ? 'Synced' : 'Connecting...'}</span>
-            </div>
-            <div className="flex items-center gap-2 text-sm text-gray-400">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-              </svg>
-              <span>{roomState.listeners} listening</span>
+              <span className="w-2 h-2 rounded-full bg-green-500" />
+              <span className="text-gray-400">Ready</span>
             </div>
           </div>
         </div>
@@ -259,7 +315,7 @@ export default function Room() {
           <div className="lg:col-span-2 space-y-8">
             {/* Now Playing */}
             <section className="card p-8 glow-border">
-              {roomState.currentTrack ? (
+              {currentTrack ? (
                 <>
                   <div className="text-center mb-8">
                     <div className="w-32 h-32 mx-auto mb-6 rounded-xl bg-gradient-to-br from-midnight-600 to-midnight-700 flex items-center justify-center">
@@ -267,8 +323,8 @@ export default function Room() {
                         <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
                       </svg>
                     </div>
-                    <h2 className="text-2xl font-bold text-white mb-1">{roomState.currentTrack.title}</h2>
-                    <p className="text-gray-400">{roomState.currentTrack.artist}</p>
+                    <h2 className="text-2xl font-bold text-white mb-1">{currentTrack.title}</h2>
+                    <p className="text-gray-400">{currentTrack.artist}</p>
                   </div>
 
                   {/* Progress Bar */}
@@ -280,12 +336,12 @@ export default function Room() {
                     >
                       <div
                         className="h-full bg-gradient-to-r from-midnight-500 to-midnight-400 rounded-full transition-all duration-100"
-                        style={{ width: `${(roomState.currentTime / roomState.currentTrack.duration) * 100}%` }}
+                        style={{ width: `${currentTrack.duration > 0 ? (currentTime / currentTrack.duration) * 100 : 0}%` }}
                       />
                     </div>
                     <div className="flex justify-between mt-2 text-sm text-gray-500">
-                      <span>{formatTime(roomState.currentTime)}</span>
-                      <span>{formatTime(roomState.currentTrack.duration)}</span>
+                      <span>{formatTime(currentTime)}</span>
+                      <span>{formatTime(currentTrack.duration || 0)}</span>
                     </div>
                   </div>
 
@@ -293,10 +349,9 @@ export default function Room() {
                   <div className="flex items-center justify-center gap-6">
                     <button
                       onClick={togglePlay}
-                      disabled={!isHost}
-                      className="w-16 h-16 rounded-full bg-midnight-500 hover:bg-midnight-400 flex items-center justify-center transition-all hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed"
+                      className="w-16 h-16 rounded-full bg-midnight-500 hover:bg-midnight-400 flex items-center justify-center transition-all hover:scale-105"
                     >
-                      {roomState.isPlaying ? (
+                      {isPlaying ? (
                         <svg className="w-8 h-8 text-white" fill="currentColor" viewBox="0 0 24 24">
                           <path d="M6 4h4v16H6V4zm8 0h4v16h-4V4z"/>
                         </svg>
@@ -308,7 +363,7 @@ export default function Room() {
                     </button>
                     <button
                       onClick={nextTrack}
-                      disabled={!isHost || roomState.queue.length === 0}
+                      disabled={queue.length === 0}
                       className="w-12 h-12 rounded-full bg-midnight-700 hover:bg-midnight-600 flex items-center justify-center transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                     >
                       <svg className="w-6 h-6 text-white" fill="currentColor" viewBox="0 0 24 24">
@@ -337,12 +392,12 @@ export default function Room() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
                 </svg>
                 Queue
-                <span className="text-sm font-normal text-gray-500">({roomState.queue.length} songs)</span>
+                <span className="text-sm font-normal text-gray-500">({queue.length} songs)</span>
               </h3>
 
-              {roomState.queue.length > 0 ? (
+              {queue.length > 0 ? (
                 <div className="space-y-2">
-                  {roomState.queue.map((track, index) => (
+                  {queue.map((track, index) => (
                     <div key={track.id} className="flex items-center justify-between p-3 rounded-lg bg-midnight-900 hover:bg-midnight-700 transition-colors">
                       <div className="flex items-center gap-3">
                         <span className="text-gray-500 font-mono w-6">{String(index + 1).padStart(2, '0')}</span>
@@ -379,26 +434,38 @@ export default function Room() {
                 Library
               </h3>
 
-              <div className="grid grid-cols-2 gap-3">
-                {library.map((track) => (
-                  <button
-                    key={track.id}
-                    onClick={() => addToQueue(track)}
-                    className="p-4 rounded-lg bg-midnight-900 hover:bg-midnight-700 text-left transition-all hover:scale-105 group"
+              {isLoadingLibrary ? (
+                <p className="text-gray-500 text-center py-8">Loading library...</p>
+              ) : library.length === 0 ? (
+                <div className="text-center py-8">
+                  <p className="text-gray-500 mb-4">No tracks in library yet.</p>
+                  <a
+                    href="https://github.com/DIVAXADI/synchrony/releases/tag/v1.0.0-music"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-midnight-400 hover:text-midnight-300 text-sm underline"
                   >
-                    <div className="w-full aspect-square mb-2 rounded bg-gradient-to-br from-midnight-600 to-midnight-700 flex items-center justify-center">
-                      <svg className="w-8 h-8 text-midnight-400 group-hover:text-midnight-300 transition-colors" fill="currentColor" viewBox="0 0 24 24">
-                        <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
-                      </svg>
-                    </div>
-                    <p className="text-white text-sm font-medium truncate">{track.title}</p>
-                    <p className="text-gray-500 text-xs truncate">{track.artist}</p>
-                  </button>
-                ))}
-              </div>
-
-              {library.length === 0 && (
-                <p className="text-gray-500 text-center py-8">No tracks in library yet.</p>
+                    Add music to GitHub Releases →
+                  </a>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  {library.map((track) => (
+                    <button
+                      key={track.id}
+                      onClick={() => addToQueue(track)}
+                      className="p-4 rounded-lg bg-midnight-900 hover:bg-midnight-700 text-left transition-all hover:scale-105 group"
+                    >
+                      <div className="w-full aspect-square mb-2 rounded bg-gradient-to-br from-midnight-600 to-midnight-700 flex items-center justify-center">
+                        <svg className="w-8 h-8 text-midnight-400 group-hover:text-midnight-300 transition-colors" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/>
+                        </svg>
+                      </div>
+                      <p className="text-white text-sm font-medium truncate">{track.title}</p>
+                      <p className="text-gray-500 text-xs truncate">{track.artist}</p>
+                    </button>
+                  ))}
+                </div>
               )}
             </section>
 
