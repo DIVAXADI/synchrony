@@ -19,6 +19,7 @@ export async function GET() {
   try {
     const headers: Record<string, string> = {
       'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'Synchrony-App',
     }
 
     if (GITHUB_TOKEN) {
@@ -27,7 +28,10 @@ export async function GET() {
 
     const response = await fetch(
       `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/v1.0.0-music`,
-      { headers }
+      {
+        headers,
+        cache: 'no-store' // Always fetch fresh data
+      }
     )
 
     if (!response.ok) {
