@@ -30,8 +30,8 @@ interface RoomState {
 }
 
 export default function Room() {
-  const params = useParams()
-  const roomCode = params.code as string
+  const params = useParams<{ code: string }>()
+  const roomCode = params.code
 
   const [socket, setSocket] = useState<Socket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
