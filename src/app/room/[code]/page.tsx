@@ -201,7 +201,10 @@ export default function Room() {
 
       if (audioRef.current) {
         audioRef.current.src = newTrack.url
-        audioRef.current.play()
+        audioRef.current.load()
+        audioRef.current.play().catch(err => {
+          console.error('Play error:', err)
+        })
       }
     } else {
       const newQueue = [...queue, newTrack]
@@ -282,7 +285,18 @@ export default function Room() {
           onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
           onEnded={nextTrack}
           onLoadedMetadata={(e) => {
-            // Update duration if different
+            const duration = e.currentTarget.duration
+            if (duration && isFinite(duration)) {
+              setCurrentTrack(prev => prev ? { ...prev, duration } : null)
+            }
+          }}
+          onError={(e) => {
+            console.error('Audio error:', e.currentTarget.error)
+          }}
+          onCanPlay={() => {
+            if (isPlaying && audioRef.current) {
+              audioRef.current.play().catch(console.error)
+            }
           }}
         />
       )}
